@@ -1,0 +1,13 @@
+[project]
+name = "httpbinary"
+version = "0.1.0"
+description = "Byte-faithful HTTP testing primitives for binary payloads"
+readme = "README.md"
+requires-python = ">=3.11"
+# Zero third party dependencies: the package uses the Python 3.11 standard
+# library only, so that it runs offline in any sandbox.
+dependencies = []
+
+[tool.httpbinary]
+# The package is used in place from the repository root; it is not published.
+publish = false
