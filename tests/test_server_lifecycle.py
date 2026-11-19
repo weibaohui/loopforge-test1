@@ -2,6 +2,7 @@
 
 import socket
 import threading
+import time
 import unittest
 
 from httpbinary import BinaryTestServer, post_binary, request_binary
@@ -98,8 +99,36 @@ class RepeatedRunTests(unittest.TestCase):
         for _ in range(3):
             with BinaryTestServer() as server:
                 post_binary(server.base_url + "/echo", b"payload")
+                self.assertTrue(server.server_thread.is_alive())
+            # The server thread must be gone once the context manager exits.
+            self.assertFalse(server.server_thread.is_alive())
         after = {thread.ident for thread in threading.enumerate()}
-        self.assertTrue(before.issubset(after))
+        # A thread that appears during the cycles and is still alive at the
+        # end is a leak.  The comparison has to look at the threads that were
+        # *added*; ``before.issubset(after)`` would hold for any leak.
+        self.assertEqual(after - before, set())
+
+    def test_no_request_thread_outlives_stop(self):
+        """C-7: an in-flight request thread does not outlive the server."""
+        server = BinaryTestServer()
+        server.start()
+        connection = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        # A request that announces a body it never sends: the handler stays
+        # blocked on the body until the server is stopped.
+        connection.sendall(
+            b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc"
+        )
+        time.sleep(0.2)
+        try:
+            server.stop()
+            alive = [
+                thread.name
+                for thread in threading.enumerate()
+                if thread.is_alive() and "process_request_thread" in thread.name
+            ]
+            self.assertEqual(alive, [])
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

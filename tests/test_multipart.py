@@ -96,6 +96,22 @@ class MultipartTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             build_multipart({}, {"upload": ("f.bin", "text", "text/plain")})
 
+    def test_non_ascii_filename_survives_the_roundtrip(self):
+        """L-3: a non ASCII file name is decoded as UTF-8."""
+        body, content_type = build_multipart(
+            {}, {"upload": ("测试-файл.bin", b"\x00\x01", "application/octet-stream")}
+        )
+        parts = parse_multipart(body, content_type)
+        self.assertEqual(parts["upload"][0].filename, "测试-файл.bin")
+        self.assertEqual(parts["upload"][0].data, b"\x00\x01")
+
+    def test_content_type_with_a_line_break_is_rejected(self):
+        """L-4: a content type cannot inject another part header."""
+        with self.assertRaises(ValueError):
+            build_multipart(
+                {}, {"upload": ("f.bin", b"data", "text/plain\r\nX-Injected: 1")}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

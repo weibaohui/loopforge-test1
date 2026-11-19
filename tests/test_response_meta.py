@@ -3,7 +3,7 @@
 import hashlib
 import unittest
 
-from httpbinary import BinaryTestServer, deterministic_bytes, request_binary
+from httpbinary import BinaryTestServer, Headers, deterministic_bytes, request_binary
 
 
 class ResponseMetaTests(unittest.TestCase):
@@ -49,6 +49,18 @@ class ResponseMetaTests(unittest.TestCase):
             headers={"X-Custom-Header": "custom-value"},
         )
         self.assertIn(b"custom-value", response.body)
+
+    def test_headers_accept_a_mapping(self):
+        """L-8: a plain mapping can be turned into headers."""
+        headers = Headers({"Content-Type": "application/json"})
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(headers.get("CONTENT-TYPE"), "application/json")
+
+    def test_repeated_headers_keep_every_value(self):
+        """L-2: the individual values of a repeated header stay available."""
+        headers = Headers([("X-Trace", "one"), ("X-Trace", "two")])
+        self.assertEqual(headers.get_all("x-trace"), ["one", "two"])
+        self.assertEqual(headers["X-Trace"], "one, two")
 
 
 if __name__ == "__main__":

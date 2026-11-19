@@ -118,6 +118,25 @@ class AssertionTests(unittest.TestCase):
         self.assertIn("00 01", message)
         self.assertIn("00 02", message)
 
+    def test_assert_body_equals_rejects_a_str_expectation(self):
+        """L-9: a str expectation is refused instead of being encoded."""
+        with self.assertRaises(TypeError) as caught:
+            assert_body_equals(make_response(b"abc"), "abc")
+        self.assertIn("str", str(caught.exception))
+
+    def test_assert_body_equals_rejects_a_non_bytes_expectation(self):
+        """L-9: only bytes-like expectations are accepted."""
+        with self.assertRaises(TypeError):
+            assert_body_equals(make_response(b"abc"), 3)
+
+    def test_empty_window_is_labelled_honestly(self):
+        """L-10: an empty context window does not claim a byte."""
+        with self.assertRaises(BinaryAssertionError) as caught:
+            assert_body_equals(make_response(b"abc"), b"")
+        message = str(caught.exception)
+        self.assertIn("expected[0..-1]", message)
+        self.assertNotIn("expected[0..0]", message)
+
 
 if __name__ == "__main__":
     unittest.main()

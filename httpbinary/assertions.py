@@ -89,7 +89,17 @@ def assert_body_equals(resp, expected: bytes) -> None:
 
     Raises:
         BinaryAssertionError: If the bodies differ.
+        TypeError: If ``expected`` is a ``str``.
     """
+    if isinstance(expected, str):
+        raise TypeError(
+            "expected must be bytes-like, not str; encode the payload "
+            "explicitly so that no implicit text conversion happens"
+        )
+    if not isinstance(expected, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"expected must be bytes-like, got {type(expected).__name__}"
+        )
     expected_bytes = bytes(expected)
     actual_bytes = resp.body
     if actual_bytes == expected_bytes:
@@ -187,6 +197,17 @@ def _hex_window(data: bytes, start: int, end: int, truncated_left: bool,
     return " ".join(parts)
 
 
+def _range_label(start: int, end: int) -> str:
+    """Render the ``[start..end]`` label of a context window.
+
+    An empty window is rendered as ``[start..start-1]`` so that the label
+    never claims a byte that is not part of the dump.
+    """
+    if end <= start:
+        return f"[{start}..{start - 1}]"
+    return f"[{start}..{end - 1}]"
+
+
 def _format_body_mismatch(expected: bytes, actual: bytes, offset: int) -> str:
     """Build the failure message of :func:`assert_body_equals`."""
     longest = max(len(expected), len(actual))
@@ -203,6 +224,6 @@ def _format_body_mismatch(expected: bytes, actual: bytes, offset: int) -> str:
     return (
         f"binary body mismatch at offset {offset}\n"
         f"  expected length: {len(expected)}, actual length: {len(actual)}\n"
-        f"  {'expected':<8}[{start}..{max(expected_end - 1, start)}]: {expected_hex}\n"
-        f"  {'actual':<8}[{actual_start}..{max(actual_end - 1, actual_start)}]: {actual_hex}"
+        f"  {'expected':<8}{_range_label(start, expected_end)}: {expected_hex}\n"
+        f"  {'actual':<8}{_range_label(actual_start, actual_end)}: {actual_hex}"
     )

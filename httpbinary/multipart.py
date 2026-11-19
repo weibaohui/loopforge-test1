@@ -104,7 +104,13 @@ def build_multipart(
             raise TypeError(
                 f"file {name!r} must carry bytes-like data, got {type(data).__name__}"
             )
-        file_items.append((str(name), str(filename), bytes(data), str(content_type)))
+        content_type_text = str(content_type)
+        if "\r" in content_type_text or "\n" in content_type_text:
+            raise ValueError(
+                f"file {name!r} has a content type with a line break; it could "
+                "inject an extra part header"
+            )
+        file_items.append((str(name), str(filename), bytes(data), content_type_text))
 
     payloads = [data for _, data in field_items]
     payloads.extend(data for _, _, data, _ in file_items)
@@ -179,13 +185,26 @@ def _boundary_from_content_type(content_type: str) -> bytes:
     return str(boundary).encode("utf-8")
 
 
+def _decode_header_bytes(raw: bytes) -> str:
+    """Decode a header line, preferring UTF-8 over the latin-1 fallback.
+
+    The builder encodes the parameters as UTF-8, so decoding them the same
+    way keeps a non ASCII file name readable; latin-1 is only used when the
+    bytes are not valid UTF-8.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
 def _parse_part_headers(raw: bytes) -> email.message.Message:
     """Parse the header block of a single multipart part."""
     message = email.message.Message()
     for line in raw.split(b"\r\n"):
         if not line.strip():
             continue
-        name, _, value = line.decode("latin-1").partition(":")
+        name, _, value = _decode_header_bytes(line).partition(":")
         message[name.strip()] = value.strip()
     return message
 

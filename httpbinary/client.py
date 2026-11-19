@@ -31,14 +31,20 @@ class Headers(Mapping):
     Lookup is case-insensitive (``headers["content-type"]`` and
     ``headers["Content-Type"]`` return the same value) while iteration yields
     the header names in their original spelling.  Repeated headers are joined
-    with ``", "`` which matches the semantics used by
-    :class:`email.message.Message`.
+    with ``", "`` so that no value is lost in a single lookup; use
+    :meth:`get_all` to see the individual values.
+
+    Note that this differs from :class:`email.message.Message`, which returns
+    the *first* value of a repeated header and keeps the rest in
+    ``get_all()``.
     """
 
     __slots__ = ("_pairs", "_index")
 
     def __init__(self, pairs=()):
-        """Build a header mapping from an iterable of ``(name, value)`` pairs."""
+        """Build a header mapping from pairs or from another mapping."""
+        if isinstance(pairs, Mapping):
+            pairs = pairs.items()
         self._pairs = [(str(name), str(value)) for name, value in pairs]
         index: dict[str, str] = {}
         for name, value in self._pairs:
@@ -48,6 +54,11 @@ class Headers(Mapping):
 
     def __getitem__(self, name):
         return self._index[str(name).lower()]
+
+    def get_all(self, name) -> list[str]:
+        """Return every value of the header ``name``, in the original order."""
+        key = str(name).lower()
+        return [value for header, value in self._pairs if header.lower() == key]
 
     def __iter__(self):
         seen = set()
@@ -166,17 +177,23 @@ def _read_body(response, limit: int) -> bytes:
       rejected without touching the payload at all.
     * chunked (or no length at all): the body is read block by block and the
       running total is checked against the limit after every block.
+
+    ``Transfer-Encoding: chunked`` takes precedence over ``Content-Length``,
+    as required by RFC 9112; a server that sends both is framed by the
+    chunked encoding.
     """
-    declared = response.getheader("Content-Length")
-    if declared is not None:
-        try:
-            size = int(declared)
-        except (TypeError, ValueError):
-            size = None
-        if size is not None:
-            if size > limit:
-                raise _too_large(limit, 0)
-            return response.read(size)
+    encoding = response.getheader("Transfer-Encoding") or ""
+    if "chunked" not in encoding.lower():
+        declared = response.getheader("Content-Length")
+        if declared is not None:
+            try:
+                size = int(declared)
+            except (TypeError, ValueError):
+                size = None
+            if size is not None:
+                if size > limit:
+                    raise _too_large(limit, 0, 0, subject="response body")
+                return response.read(size)
 
     blocks: list[bytes] = []
     total = 0
@@ -188,21 +205,27 @@ def _read_body(response, limit: int) -> bytes:
         if total + len(block) > limit:
             # The offending block is dropped, so the number of bytes held in
             # memory never exceeds the configured limit.
-            raise _too_large(limit, total)
+            raise _too_large(limit, total + len(block), total,
+                             subject="response body")
         blocks.append(block)
         total += len(block)
     return b"".join(blocks)
 
 
-def _too_large(limit: int, bytes_read: int) -> BodyTooLargeError:
+def _too_large(limit: int, bytes_read: int, bytes_retained: int | None = None,
+               *, subject: str = "body") -> BodyTooLargeError:
     """Build a :class:`BodyTooLargeError` describing a rejected body."""
+    if bytes_retained is None:
+        bytes_retained = bytes_read
     error = BodyTooLargeError(
-        f"body exceeds the limit of {limit} bytes "
-        f"({bytes_read} bytes were read into memory); "
-        "the body was not fully read"
+        f"{subject} exceeds the limit of {limit} bytes "
+        f"({bytes_read} bytes were read from the wire, "
+        f"{bytes_retained} bytes were retained in memory); "
+        f"the {subject} was not fully read"
     )
     error.limit = limit
     error.bytes_read = bytes_read
+    error.bytes_retained = bytes_retained
     return error
 
 
@@ -229,15 +252,26 @@ def request_binary(
             :class:`~httpbinary.errors.HTTPBinaryError` instead of being
             returned.  By default error responses are returned normally so
             that the assertion helpers can report them.
-        max_body_bytes: In-memory ceiling for the response body.
+        max_body_bytes: In-memory ceiling for the request body and for the
+            response body.
         chunked: When true the request body is sent using chunked transfer
             encoding.  The framing is performed by this library because
             :mod:`http.client` does not encode request bodies.
 
     Returns:
         A :class:`BinaryResponse` whose ``body`` is the raw response bytes.
+
+    Raises:
+        TypeError: If the request body is a ``str``.
+        BodyTooLargeError: If the request body exceeds ``max_body_bytes``.
+        HTTPBinaryError: If the transport fails; a socket timeout is
+            propagated as :class:`TimeoutError`.
     """
     payload = _coerce_body(body)
+    if len(payload) > max_body_bytes:
+        # The request is never put on the wire, so the peer cannot observe a
+        # half written body and the outcome is deterministic.
+        raise _too_large(max_body_bytes, 0, 0, subject="request body")
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https"):
@@ -255,26 +289,35 @@ def request_binary(
     )
     connection = connection_class(host, port, timeout=timeout)
     try:
-        connection.putrequest(method.upper(), target, skip_accept_encoding=True)
-        for name, value in (headers or {}).items():
-            # The framing headers are managed by the library, otherwise the
-            # request could carry two conflicting values for them.
-            if str(name).lower() in ("content-length", "transfer-encoding"):
-                continue
-            connection.putheader(name, value)
-        if chunked:
-            connection.putheader("Transfer-Encoding", "chunked")
-            connection.endheaders(_encode_chunked(payload))
-        else:
-            connection.putheader("Content-Length", str(len(payload)))
-            connection.endheaders(payload)
-        raw = connection.getresponse()
         try:
-            response_headers = Headers(raw.getheaders())
-            status = raw.status
-            response_body = _read_body(raw, max_body_bytes)
-        finally:
-            raw.close()
+            connection.putrequest(method.upper(), target, skip_accept_encoding=True)
+            for name, value in (headers or {}).items():
+                # The framing headers are managed by the library, otherwise the
+                # request could carry two conflicting values for them.
+                if str(name).lower() in ("content-length", "transfer-encoding"):
+                    continue
+                connection.putheader(name, value)
+            if chunked:
+                connection.putheader("Transfer-Encoding", "chunked")
+                connection.endheaders(_encode_chunked(payload))
+            else:
+                connection.putheader("Content-Length", str(len(payload)))
+                connection.endheaders(payload)
+            raw = connection.getresponse()
+            try:
+                response_headers = Headers(raw.getheaders())
+                status = raw.status
+                response_body = _read_body(raw, max_body_bytes)
+            finally:
+                raw.close()
+        except TimeoutError:
+            # A timeout is an expected, documented outcome (C-5); it keeps its
+            # own type so that callers can distinguish it from a real error.
+            raise
+        except (http.client.HTTPException, OSError) as exc:
+            raise HTTPBinaryError(
+                f"HTTP request to {url!r} failed: {exc}"
+            ) from exc
     finally:
         connection.close()
 

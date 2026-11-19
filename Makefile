@@ -12,7 +12,7 @@ test:
 # public API (AC-12).
 check:
 	$(PYTHON) -m compileall -q httpbinary tests
-	@if grep -rnE "TODO|FIXME" httpbinary tests; then \
+	@if grep -rnE --exclude-dir=__pycache__ "TODO|FIXME" httpbinary tests; then \
 		echo "ERROR: TODO/FIXME markers found"; \
 		exit 1; \
 	fi

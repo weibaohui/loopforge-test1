@@ -4,18 +4,24 @@ The server binds ``127.0.0.1`` only.  It exists so that the client can be
 tested against a real socket without leaving the machine, and so that the
 request side of a payload can be verified byte by byte.
 
-Two details deserve attention:
+Three details deserve attention:
 
 * ``BaseHTTPRequestHandler`` does not decode chunked request bodies, so the
   handler implements the framing itself.
-* The request threads are daemon threads and the server is shut down
-  explicitly, so no thread or port survives the end of a test case.
+* A request body is checked against the limit *before* it is buffered, and an
+  oversized body is drained instead of being left on the wire.
+* The request threads are daemon threads, but the server keeps track of the
+  requests that are still in flight and waits for them when it is stopped,
+  so no thread or port survives the end of a test case.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import socket
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -27,6 +33,22 @@ __all__ = ["BinaryTestServer", "deterministic_bytes", "BLOB_PAYLOAD", "BYTES_SEE
 
 #: Seed of the deterministic byte stream served by ``/bytes/<n>``.
 BYTES_SEED = b"httpbinary/bytes/v1"
+
+#: Maximum number of bytes that are drained from an oversized request body.
+_MAX_DRAIN_BYTES = 64 * 1024 * 1024
+
+#: Errno values that mean "the peer is gone"; they are not server errors.
+_CONNECTION_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ENOTCONN", None),
+        getattr(errno, "EBADF", None),
+    )
+    if value is not None
+)
 
 
 def deterministic_bytes(n: int, seed: bytes = BYTES_SEED) -> bytes:
@@ -82,8 +104,22 @@ class _BinaryHandler(BaseHTTPRequestHandler):
     server_version = "httpbinary/0.1"
     sys_version = ""
 
+    #: Socket timeout of a connection, in seconds.  It keeps a half open
+    #: request from pinning a thread forever.
+    timeout = 10
+
+    #: Length of a request body that was rejected before it was read.
+    _pending_length = None
+
+    #: Size of a chunk that was rejected before it was read.
+    _pending_chunk_size = None
+
     def log_message(self, format, *args) -> None:  # noqa: A002 - stdlib signature
         """Silence the default stderr access log."""
+        return
+
+    def log_error(self, format, *args) -> None:  # noqa: A002 - stdlib signature
+        """Silence the default stderr error log."""
         return
 
     # -- routing ---------------------------------------------------------
@@ -140,7 +176,11 @@ class _BinaryHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_request_body()
             except _PayloadTooLarge:
+                # The answer goes out first, the rest of the request body is
+                # drained afterwards: the peer can then finish writing and
+                # still read the 413 instead of a broken pipe.
                 self._respond(413, b"payload too large\n", "text/plain; charset=utf-8")
+                self._drain_request_body()
                 return
             if path == "/echo":
                 self._respond(200, body, "application/octet-stream")
@@ -183,6 +223,10 @@ class _BinaryHandler(BaseHTTPRequestHandler):
         except ValueError:
             return b""
         if length > MAX_BODY_BYTES:
+            # The body is not buffered; it is drained after the answer has
+            # been sent, so that the peer can finish writing and read the
+            # answer instead of losing the connection to a broken pipe.
+            self._pending_length = length
             raise _PayloadTooLarge()
         if length <= 0:
             return b""
@@ -213,11 +257,65 @@ class _BinaryHandler(BaseHTTPRequestHandler):
                     if trailer in (b"\r\n", b"\n", b""):
                         break
                 break
+            if len(body) + size > MAX_BODY_BYTES:
+                # The chunk is rejected *before* it is buffered, so a single
+                # oversized chunk cannot exhaust the memory of the process.
+                self._pending_chunk_size = size
+                raise _PayloadTooLarge()
             body += self.rfile.read(size)
             self.rfile.read(2)  # the CRLF that follows the chunk data
-            if len(body) > MAX_BODY_BYTES:
-                raise _PayloadTooLarge()
         return bytes(body)
+
+    def _drain_request_body(self) -> None:
+        """Read and discard whatever is left of the request body."""
+        encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in encoding.lower():
+            pending = self._pending_chunk_size
+            self._pending_chunk_size = None
+            if pending:
+                self._discard(pending)
+                self.rfile.read(2)  # the CRLF that follows the chunk data
+            self._drain_chunked_body()
+            return
+        length = self._pending_length
+        self._pending_length = None
+        if length:
+            self._discard(length)
+
+    def _drain_chunked_body(self) -> None:
+        """Read and discard the remaining chunks of a chunked request body."""
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                return
+            size_field = line.split(b";", 1)[0].strip()
+            if not size_field:
+                continue
+            try:
+                size = int(size_field, 16)
+            except ValueError:
+                return
+            if size == 0:
+                while True:
+                    trailer = self.rfile.readline(65536)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                return
+            self._discard(size)
+            self.rfile.read(2)  # the CRLF that follows the chunk data
+
+    def _discard(self, count: int) -> None:
+        """Read ``count`` bytes from the request body and throw them away.
+
+        Only a bounded amount is drained; beyond that the connection is
+        closed, which is acceptable for a loopback test server.
+        """
+        remaining = min(count, _MAX_DRAIN_BYTES)
+        while remaining > 0:
+            block = self.rfile.read(min(65536, remaining))
+            if not block:
+                return
+            remaining -= len(block)
 
     def _respond(self, code: int, body: bytes, content_type: str,
                  extra_headers=()) -> None:
@@ -280,6 +378,72 @@ class _BinaryHandler(BaseHTTPRequestHandler):
         )
 
 
+class _TrackingHTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that keeps track of the requests in flight.
+
+    :class:`socketserver.ThreadingMixIn` only registers *non daemon* request
+    threads, so ``server_close()`` does not wait for them.  This subclass
+    registers every request thread and connection, which lets
+    :meth:`BinaryTestServer.stop` interrupt the connections that are still
+    open and wait for their threads to finish.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Create the server and the registries of the in-flight requests."""
+        self._request_threads: set[threading.Thread] = set()
+        self._open_requests: set[socket.socket] = set()
+        self._registry_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request_thread(self, request, client_address) -> None:
+        """Serve a request while registering its thread and connection."""
+        thread = threading.current_thread()
+        with self._registry_lock:
+            self._request_threads.add(thread)
+            self._open_requests.add(request)
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._registry_lock:
+                self._request_threads.discard(thread)
+                self._open_requests.discard(request)
+
+    def handle_error(self, request, client_address) -> None:
+        """Ignore the errors of a connection that the peer aborted.
+
+        A client that goes away while the server is still writing or draining
+        is a normal event for a loopback test server, so the connection
+        errors are swallowed.  Every other error is reported the way the
+        standard library reports it, so a genuine bug stays visible.
+        """
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            return
+        if isinstance(error, OSError) and error.errno in _CONNECTION_ERRNOS:
+            return
+        super().handle_error(request, client_address)
+
+    def abort_open_requests(self) -> None:
+        """Shut down the connections of the requests that are still running."""
+        with self._registry_lock:
+            connections = list(self._open_requests)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def wait_for_request_threads(self, timeout: float = 5.0) -> None:
+        """Wait for the request threads that are still running."""
+        with self._registry_lock:
+            threads = list(self._request_threads)
+        for thread in threads:
+            thread.join(timeout=timeout)
+
+
 class BinaryTestServer:
     """A loopback HTTP server for binary payload testing.
 
@@ -317,9 +481,7 @@ class BinaryTestServer:
         """
         if self._httpd is not None:
             return
-        httpd = ThreadingHTTPServer((self._host, self._requested_port), _BinaryHandler)
-        httpd.daemon_threads = True
-        httpd.allow_reuse_address = True
+        httpd = _TrackingHTTPServer((self._host, self._requested_port), _BinaryHandler)
         thread = threading.Thread(
             target=httpd.serve_forever,
             kwargs={"poll_interval": 0.05},
@@ -333,14 +495,19 @@ class BinaryTestServer:
     def stop(self) -> None:
         """Stop the server and release its thread and port.
 
-        The call is idempotent and safe to use in a ``finally`` block.
+        The call is idempotent and safe to use in a ``finally`` block.  The
+        connections that are still in flight are interrupted and their
+        threads are waited for, so that no request thread outlives the
+        server.
         """
         httpd = self._httpd
         thread = self._thread
         self._httpd = None
         if httpd is not None:
             httpd.shutdown()
+            httpd.abort_open_requests()
             httpd.server_close()
+            httpd.wait_for_request_threads()
         if thread is not None:
             thread.join(timeout=5.0)
 

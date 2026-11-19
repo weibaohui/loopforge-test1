@@ -97,11 +97,13 @@ context manager releases the thread and the port.
 
 ## Limits
 
-* `MAX_BODY_BYTES` (8 MiB by default) caps the in-memory size of a body.
-  A `Content-Length` is checked against the limit *before* the body is read;
-  a chunked body is counted while it is read. Either way a
-  `BodyTooLargeError` is raised and the oversized body is never buffered.
-  The limit can be overridden per call with `max_body_bytes`.
+* `MAX_BODY_BYTES` (8 MiB by default) caps the in-memory size of a request
+  body and of a response body. A request body that is too large is rejected
+  before a single byte reaches the wire. A response `Content-Length` is
+  checked against the limit *before* the body is read; a chunked body is
+  counted while it is read. Either way a `BodyTooLargeError` is raised and
+  the oversized body is never buffered. The limit can be overridden per call
+  with `max_body_bytes`.
 * Every request has a timeout (10 s by default); a silent server makes the
   client raise `TimeoutError` instead of hanging.
 
