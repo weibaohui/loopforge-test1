@@ -1,6 +1,7 @@
 """The body size ceiling is enforced before the body is buffered (AC-9)."""
 
 import socket
+import tracemalloc
 import unittest
 
 from httpbinary import (
@@ -112,6 +113,50 @@ class LimitTests(unittest.TestCase):
             self.server.base_url + "/bytes/500", method="GET", max_body_bytes=1000
         )
         self.assertEqual(response.length, 500)
+
+    def test_oversized_chunk_is_not_buffered_by_the_server(self):
+        """M-1: a single oversized chunk is refused before it is buffered.
+
+        The chunk data is streamed in 64 KiB blocks, so the client itself
+        never holds the payload: a traced memory peak of several MiB can only
+        come from the server buffering the chunk.
+        """
+        chunk_size = 32 * 1024 * 1024
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            connection = socket.create_connection(
+                ("127.0.0.1", self.server.port), timeout=30
+            )
+            try:
+                connection.sendall(
+                    b"POST /echo HTTP/1.1\r\nHost: x\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n"
+                )
+                connection.sendall(b"%x\r\n" % chunk_size)
+                block = b"z" * 65536
+                try:
+                    for _ in range(chunk_size // 65536):
+                        connection.sendall(block)
+                except OSError:
+                    # The server may close the connection once it answered.
+                    pass
+                connection.settimeout(30)
+                answer = b""
+                while b"\r\n\r\n" not in answer:
+                    part = connection.recv(4096)
+                    if not part:
+                        break
+                    answer += part
+            finally:
+                connection.close()
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+        self.assertIn(b"413", answer.split(b"\r\n")[0])
+        self.assertLess(peak - base, 8 * 1024 * 1024)
 
     def test_default_limit_is_eight_mebibytes(self):
         """AC-9: the documented default ceiling is in effect."""
